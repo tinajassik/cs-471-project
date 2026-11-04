@@ -1,0 +1,202 @@
+"""Baseline MoE-layer benchmark: No Load Balance, contiguous placement, Zipf routing.
+
+Launch one process per GPU:
+    torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark --alphas 0,1 --batch-sizes 1,64,1024
+"""
+import argparse
+import csv
+import os
+import statistics
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+from .moe_layer import (
+    ExpertShape,
+    MoELayer,
+    build_plan,
+    outputs_match,
+    reference_output,
+    token_homes,
+)
+from .routing import contiguous_placement, load_metrics, sample_assignments, zipf_probabilities
+
+PHASES = ("dispatch", "compute", "combine")
+NEXT_PHASE = {"start": "dispatch", "dispatch": "compute", "compute": "combine"}
+RAW_FIELDS = [
+    "alpha", "batch_size", "layers", "world_size", "step", "rank",
+    "dispatch_ms", "compute_ms", "combine_ms", "total_ms",
+    "tokens", "activated", "bytes_sent",
+    "expert_imbalance", "gpu_imbalance", "max_tokens_per_gpu", "max_activated_per_gpu",
+]
+
+
+class EventPhases:
+    """Times each phase with CUDA events, and labels it for Nsight Systems with NVTX."""
+
+    def __init__(self):
+        self.events = {}
+
+    def mark(self, name):
+        if name != "start":
+            torch.cuda.nvtx.range_pop()
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self.events[name] = event
+        if name in NEXT_PHASE:
+            torch.cuda.nvtx.range_push(NEXT_PHASE[name])
+
+    def durations_ms(self):
+        previous = self.events["start"]
+        durations = {}
+        for name in PHASES:
+            durations[name] = previous.elapsed_time(self.events[name])
+            previous = self.events[name]
+        durations["total"] = sum(durations.values())
+        return durations
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--alphas", default="0,0.5,1,1.5", help="Zipf skew values, comma-separated")
+    parser.add_argument("--batch-sizes", default="1,4,16,64,256,1024,4096",
+                        help="total tokens per step across all GPUs, comma-separated")
+    parser.add_argument("--steps", type=int, default=100, help="measured steps per configuration")
+    parser.add_argument("--warmup", type=int, default=20, help="unmeasured steps per configuration")
+    parser.add_argument("--layers", type=int, default=1,
+                        help="separate MoE layers to cycle through, so weights are not all in cache")
+    parser.add_argument("--seed", type=int, default=471)
+    parser.add_argument("--output", type=Path, default=Path("results/baseline.csv"))
+    parser.add_argument("--verify", action="store_true",
+                        help="check outputs against a single-GPU reference (slower; don't use for timing)")
+    args = parser.parse_args()
+    args.alphas = [float(a) for a in args.alphas.split(",")]
+    args.batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
+    return args
+
+
+def make_steps(args, shape, owner, world_size, rank, alpha, batch_size, device):
+    """Build the same routing trace on every rank, from the shared seed."""
+    probabilities = zipf_probabilities(shape.num_experts, alpha, args.seed)
+    generator = torch.Generator().manual_seed(args.seed + 1)
+    steps = []
+    for _ in range(args.warmup + args.steps):
+        assignments = sample_assignments(probabilities, batch_size, shape.top_k, generator)
+        steps.append((assignments, build_plan(assignments, owner, world_size, rank).to(device)))
+    return steps
+
+
+def run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, device="cuda"):
+    """Run one (alpha, batch size) point and return this rank's per-step rows."""
+    steps = make_steps(args, shape, owner, world_size, rank, alpha, batch_size, device)
+    is_home = token_homes(batch_size, world_size) == rank
+    input_generator = torch.Generator().manual_seed(args.seed + 2 + rank)
+    x = torch.randn(int(is_home.sum()), shape.hidden_size, generator=input_generator)
+    x = x.to(dtype=torch.bfloat16, device=device)
+
+    rows = []
+    for step, (assignments, plan) in enumerate(steps):
+        layer = step % len(layers)
+        dist.barrier()
+        torch.cuda.synchronize()
+
+        phases = EventPhases()
+        output = layers[layer](x, plan, phases=phases)
+        torch.cuda.synchronize()
+
+        if args.verify:
+            home_assignments = assignments[is_home]
+            expected = reference_output(x, home_assignments, shape, layer, args.seed)
+            assert outputs_match(output, expected), (
+                f"rank {rank}: wrong output at alpha={alpha} batch={batch_size} step={step}"
+            )
+
+        if step < args.warmup:
+            continue
+        durations = phases.durations_ms()
+        metrics = load_metrics(assignments, owner, world_size)
+        rows.append({
+            "alpha": alpha,
+            "batch_size": batch_size,
+            "layers": len(layers),
+            "world_size": world_size,
+            "step": step - args.warmup,
+            "rank": rank,
+            **{f"{name}_ms": value for name, value in durations.items()},
+            "tokens": metrics.tokens_per_gpu[rank],
+            "activated": metrics.activated_per_gpu[rank],
+            "bytes_sent": plan.send_token_idx.numel() * shape.hidden_size * 2,
+            "expert_imbalance": metrics.expert_imbalance,
+            "gpu_imbalance": metrics.gpu_imbalance,
+            "max_tokens_per_gpu": metrics.max_tokens_per_gpu,
+            "max_activated_per_gpu": metrics.max_activated_per_gpu,
+        })
+    return rows
+
+
+def print_summary(rows, world_size):
+    """Print the median step latency, where each step takes as long as its slowest GPU."""
+    by_step = {}
+    for row in rows:
+        by_step.setdefault(row["step"], []).append(row)
+    step_latency = [max(r["total_ms"] for r in group) for group in by_step.values()]
+    latency = statistics.median(step_latency)
+    per_rank = "  ".join(
+        f"gpu{r}: compute {statistics.median(x['compute_ms'] for x in rows if x['rank'] == r):.3f} ms"
+        for r in range(world_size)
+    )
+    first = rows[0]
+    throughput = first["batch_size"] / (latency / 1000)
+    print(
+        f"alpha={first['alpha']:<4} batch={first['batch_size']:<5} "
+        f"latency={latency:.3f} ms  throughput={throughput:,.0f} tokens/s  "
+        f"gpu_imbalance={statistics.median(r['gpu_imbalance'] for r in rows):.2f}  {per_rank}",
+        flush=True,
+    )
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", device_id=device)
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+
+    shape = ExpertShape()
+    owner = contiguous_placement(shape.num_experts, world_size)
+    layers = [
+        MoELayer(shape, owner, rank, layer_index, args.seed).to("cuda")
+        for layer_index in range(args.layers)
+    ]
+
+    writer = None
+    if rank == 0:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        output_file = args.output.open("w", newline="")
+        writer = csv.DictWriter(output_file, RAW_FIELDS)
+        writer.writeheader()
+        expert_mb = sum(p.numel() * 2 for p in layers[0].experts["0"].parameters()) / 1e6
+        print(f"{world_size} GPUs ({torch.cuda.get_device_name()}), {shape}, {expert_mb:.1f} MB per expert, "
+              f"{args.layers} layer(s), verify={args.verify}", flush=True)
+
+    with torch.inference_mode():
+        for alpha in args.alphas:
+            for batch_size in args.batch_sizes:
+                rows = run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size)
+                gathered = [None] * world_size
+                dist.all_gather_object(gathered, rows)
+                if rank == 0:
+                    all_rows = [row for rank_rows in gathered for row in rank_rows]
+                    writer.writerows(all_rows)
+                    output_file.flush()
+                    print_summary(all_rows, world_size)
+
+    if rank == 0:
+        output_file.close()
+        print(f"BENCHMARK FINISHED, wrote {args.output}", flush=True)
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
