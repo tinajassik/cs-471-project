@@ -25,9 +25,10 @@ from .routing import contiguous_placement, load_metrics, sample_assignments, zip
 PHASES = ("dispatch", "compute", "combine")
 NEXT_PHASE = {"start": "dispatch", "dispatch": "compute", "compute": "combine"}
 RAW_FIELDS = [
+    "seed", "expert_size", "warm_passes",
     "alpha", "batch_size", "layers", "world_size", "step", "rank",
     "dispatch_ms", "compute_ms", "combine_ms", "total_ms",
-    "tokens", "activated", "bytes_sent",
+    "tokens", "activated", "bytes_sent", "new_sizes",
     "expert_imbalance", "gpu_imbalance", "max_tokens_per_gpu", "max_activated_per_gpu",
 ]
 
@@ -64,6 +65,11 @@ def parse_args():
                         help="total tokens per step across all GPUs, comma-separated")
     parser.add_argument("--steps", type=int, default=100, help="measured steps per configuration")
     parser.add_argument("--warmup", type=int, default=20, help="unmeasured steps per configuration")
+    parser.add_argument("--warm-passes", type=int, default=1,
+                        help="unmeasured replays of the measured routing, so timed steps meet no "
+                             "new expert token counts; 0 keeps the first-time cost in the timings")
+    parser.add_argument("--expert-size", type=int, default=ExpertShape.expert_size,
+                        help="expert inner width; smaller means fewer weight bytes but the same operations")
     parser.add_argument("--layers", type=int, default=1,
                         help="separate MoE layers to cycle through, so weights are not all in cache")
     parser.add_argument("--seed", type=int, default=471)
@@ -87,46 +93,67 @@ def make_steps(args, shape, owner, world_size, rank, alpha, batch_size, device):
     return steps
 
 
-def run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, device="cuda"):
-    """Run one (alpha, batch size) point and return this rank's per-step rows."""
+def run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, seen_sizes, device="cuda"):
+    """Run one (alpha, batch size) point and return this rank's per-step rows.
+
+    seen_sizes holds the expert token counts this process has already computed.
+    Each new count cost about 1 ms in the first sweep, so warm passes replay the
+    measured routing first, and new_sizes records any left in a timed step.
+    """
     steps = make_steps(args, shape, owner, world_size, rank, alpha, batch_size, device)
+    warmup_steps, measured_steps = steps[:args.warmup], steps[args.warmup:]
     is_home = token_homes(batch_size, world_size) == rank
     input_generator = torch.Generator().manual_seed(args.seed + 2 + rank)
     x = torch.randn(int(is_home.sum()), shape.hidden_size, generator=input_generator)
     x = x.to(dtype=torch.bfloat16, device=device)
 
-    rows = []
-    for step, (assignments, plan) in enumerate(steps):
-        layer = step % len(layers)
+    def run_step(index, plan):
+        sizes = {positions.numel() for _, positions in plan.expert_groups}
+        new_sizes = len(sizes - seen_sizes)
+        seen_sizes.update(sizes)
         dist.barrier()
         torch.cuda.synchronize()
 
         phases = EventPhases()
-        output = layers[layer](x, plan, phases=phases)
+        output = layers[index % len(layers)](x, plan, phases=phases)
         torch.cuda.synchronize()
+        return phases, output, new_sizes
+
+    for index, (_, plan) in enumerate(warmup_steps):
+        run_step(index, plan)
+    for _ in range(args.warm_passes):
+        for index, (_, plan) in enumerate(measured_steps):
+            run_step(index, plan)
+
+    rows = []
+    for step, (assignments, plan) in enumerate(measured_steps):
+        phases, output, new_sizes = run_step(step, plan)
 
         if args.verify:
             home_assignments = assignments[is_home]
+            layer = step % len(layers)
             expected = reference_output(x, home_assignments, shape, layer, args.seed)
             assert outputs_match(output, expected), (
                 f"rank {rank}: wrong output at alpha={alpha} batch={batch_size} step={step}"
             )
 
-        if step < args.warmup:
-            continue
         durations = phases.durations_ms()
         metrics = load_metrics(assignments, owner, world_size)
         rows.append({
+            "seed": args.seed,
+            "expert_size": shape.expert_size,
+            "warm_passes": args.warm_passes,
             "alpha": alpha,
             "batch_size": batch_size,
             "layers": len(layers),
             "world_size": world_size,
-            "step": step - args.warmup,
+            "step": step,
             "rank": rank,
             **{f"{name}_ms": value for name, value in durations.items()},
             "tokens": metrics.tokens_per_gpu[rank],
             "activated": metrics.activated_per_gpu[rank],
             "bytes_sent": plan.send_token_idx.numel() * shape.hidden_size * 2,
+            "new_sizes": new_sizes,
             "expert_imbalance": metrics.expert_imbalance,
             "gpu_imbalance": metrics.gpu_imbalance,
             "max_tokens_per_gpu": metrics.max_tokens_per_gpu,
@@ -151,7 +178,8 @@ def print_summary(rows, world_size):
     print(
         f"alpha={first['alpha']:<4} batch={first['batch_size']:<5} "
         f"latency={latency:.3f} ms  throughput={throughput:,.0f} tokens/s  "
-        f"gpu_imbalance={statistics.median(r['gpu_imbalance'] for r in rows):.2f}  {per_rank}",
+        f"gpu_imbalance={statistics.median(r['gpu_imbalance'] for r in rows):.2f}  "
+        f"new_sizes={sum(r['new_sizes'] for r in rows)}  {per_rank}",
         flush=True,
     )
 
@@ -163,7 +191,7 @@ def main():
     dist.init_process_group("nccl", device_id=device)
     rank, world_size = dist.get_rank(), dist.get_world_size()
 
-    shape = ExpertShape()
+    shape = ExpertShape(expert_size=args.expert_size)
     owner = contiguous_placement(shape.num_experts, world_size)
     layers = [
         MoELayer(shape, owner, rank, layer_index, args.seed).to("cuda")
@@ -178,12 +206,14 @@ def main():
         writer.writeheader()
         expert_mb = sum(p.numel() * 2 for p in layers[0].experts["0"].parameters()) / 1e6
         print(f"{world_size} GPUs ({torch.cuda.get_device_name()}), {shape}, {expert_mb:.1f} MB per expert, "
-              f"{args.layers} layer(s), verify={args.verify}", flush=True)
+              f"{args.layers} layer(s), seed={args.seed}, warm_passes={args.warm_passes}, "
+              f"verify={args.verify}", flush=True)
 
+    seen_sizes = set()
     with torch.inference_mode():
         for alpha in args.alphas:
             for batch_size in args.batch_sizes:
-                rows = run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size)
+                rows = run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, seen_sizes)
                 gathered = [None] * world_size
                 dist.all_gather_object(gathered, rows)
                 if rank == 0:
