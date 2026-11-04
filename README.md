@@ -15,6 +15,7 @@ setup: contiguous placement with no replicas.
 | `moe_bench/moe_layer.py` | Experts, the per-rank traffic plan, dispatch, compute and combine |
 | `moe_bench/benchmark.py` | Skew and batch-size sweep, CUDA event timing, NVTX ranges, CSV output |
 | `analysis/analyse_results.py` | Phase tables, Q3 correlations and cost fits from the CSVs |
+| `analysis/analyse_timeline.py` | How busy the GPU was during compute, from Nsight Systems traces |
 | `jobs/` | Kuma job scripts |
 | `tests/` | Logic tests that run on a CPU, with threads standing in for GPUs |
 
@@ -55,12 +56,30 @@ separate software overhead from the cost of reading weights:
 sbatch jobs/baseline_control.sbatch
 ```
 
-Output goes to `results/`, and the printed log to `<job name>_<job id>.out`.
+The same control at batches 1024 to 65536, where tokens matter more:
+
+```bash
+sbatch jobs/baseline_control_large.sbatch
+```
+
+And a Nsight Systems trace, to see whether compute waits on the CPU or the GPU.
+Tracing slows kernel launches, so don't use these runs as timing results:
+
+```bash
+sbatch jobs/baseline_timeline.sbatch
+```
+
+Output goes to `results/`, and the printed log to `<job name>_<job id>.out`. The
+last two jobs print their analysis at the end of the log.
 
 ### Analyse the results
 
 ```bash
 python analysis/analyse_results.py results/sweep_seed*.csv
+```
+
+```bash
+python analysis/analyse_timeline.py results/timeline_*.sqlite
 ```
 
 ### Run the tests

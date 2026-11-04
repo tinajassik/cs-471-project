@@ -112,14 +112,16 @@ def print_new_sizes(data):
 
 def print_across_files(named):
     print(f"{'file':>42} {'seed':>5} {'size':>5} {'layers':>6} {'warm':>4} | "
-          f"{'per expert us':>13} {'constant us':>11} {'R^2':>6} {'new/step':>8}")
+          f"{'per expert us':>13} {'constant us':>11} {'R^2':>6} {'new/step':>8} | {'per token us (batch >= 1024)':>28}")
     for name, data in named:
         info = data["info"]
         small = data["batch_size"] <= 64
+        large = data["batch_size"] >= 1024
         c, per_expert, _, r2 = cost_fit(data, small) if small.sum() >= 3 else (*[float("nan")] * 3, float("nan"))
+        per_token = cost_fit(data, large)[2] if large.sum() >= 3 else float("nan")
         new = data["new_sizes"].mean() if "new_sizes" in data else float("nan")
         print(f"{name:>42} {info['seed']:>5} {info['expert_size']:>5} {info['layers']:>6} {info['warm_passes']:>4} | "
-              f"{per_expert:13.2f} {c:11.1f} {r2:6.3f} {new:8.3f}")
+              f"{per_expert:13.2f} {c:11.1f} {r2:6.3f} {new:8.3f} | {per_token:28.4f}")
 
 
 def main():
