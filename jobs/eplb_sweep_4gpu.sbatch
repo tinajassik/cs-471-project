@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=4
-#SBATCH --time=04:00:00
+#SBATCH --time=07:00:00
 #SBATCH --output=%x_%j.out
 
 # eplb_sweep.sbatch on 4 GPUs. It keeps 8 cores per GPU, like the 2-GPU jobs, because

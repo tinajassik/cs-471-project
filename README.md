@@ -124,6 +124,14 @@ sbatch jobs/smoke_4gpu.sbatch
 sbatch jobs/eplb_sweep_4gpu.sbatch
 ```
 
+To look into slow dispatch steps on 4 GPUs, this runs one short configuration on
+different GPU pairs, then on 4 GPUs as usual, pinned to NUMA nodes (using
+`moe_bench/numa_bind.py`), and with 1 thread per process:
+
+```bash
+sbatch jobs/diag_4gpu.sbatch
+```
+
 Output goes to `results/`, and the printed log to `<job name>_<job id>.out`.
 
 ### Analyse the results
