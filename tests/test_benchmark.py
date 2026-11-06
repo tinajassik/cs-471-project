@@ -21,16 +21,21 @@ class FakePhases:
         return {"dispatch": 1.0, "compute": 2.0, "combine": 1.0, "total": 4.0}
 
 
-def run_cpu(monkeypatch, warm_passes, seen_sizes=None, shape=SHAPE, warmup=2):
+def make_args(warm_passes=1, warmup=2, balance="none"):
+    return argparse.Namespace(seed=1, warmup=warmup, steps=5, verify=True, warm_passes=warm_passes, balance=balance)
+
+
+def run_cpu(monkeypatch, warm_passes, seen_sizes=None, shape=SHAPE, warmup=2, balance="none"):
     monkeypatch.setattr(benchmark, "EventPhases", FakePhases)
     monkeypatch.setattr(benchmark.torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(benchmark.dist, "barrier", lambda: None)
-    args = argparse.Namespace(seed=1, warmup=warmup, steps=5, verify=True, warm_passes=warm_passes)
-    owner = contiguous_placement(shape.num_experts, 1)
-    layers = [MoELayer(shape, owner, 0, i, args.seed) for i in range(2)]
+    args = make_args(warm_passes, warmup, balance)
+    physical_to_logical, owner = benchmark.make_placement(args, shape, 1, 1.0)
+    layers = [MoELayer(shape, owner, 0, i, args.seed, physical_to_logical) for i in range(2)]
     seen_sizes = set() if seen_sizes is None else seen_sizes
     with torch.inference_mode():
-        return benchmark.run_config(args, shape, layers, owner, 1, 0, 1.0, 16, seen_sizes, device="cpu")
+        return benchmark.run_config(args, shape, layers, physical_to_logical, owner, 1, 0, 1.0, 16, seen_sizes,
+                                    device="cpu")
 
 
 @pytest.fixture
@@ -63,6 +68,51 @@ def test_smaller_expert_keeps_the_same_routing(monkeypatch):
     assert rows_small[0]["expert_size"] == 4
     for full, tiny in zip(rows_full, rows_small):
         assert (full["tokens"], full["activated"]) == (tiny["tokens"], tiny["activated"])
+
+
+@pytest.mark.parametrize("balance", ["eplb-1.0", "eplb-1.5"])
+def test_eplb_run_passes_the_output_check(monkeypatch, balance):
+    # run_cpu has verify on, so a wrong output would raise here.
+    rows = run_cpu(monkeypatch, warm_passes=1, balance=balance)
+    assert {row["balance"] for row in rows} == {balance}
+    assert rows[0]["physical_experts"] == {"eplb-1.0": 8, "eplb-1.5": 12}[balance]
+
+
+def test_replicas_activate_more_expert_copies(monkeypatch):
+    def mean_activated(balance):
+        rows = run_cpu(monkeypatch, warm_passes=1, balance=balance)
+        return sum(row["activated"] for row in rows) / len(rows)
+
+    assert mean_activated("eplb-1.0") == mean_activated("none")
+    assert mean_activated("eplb-1.5") > mean_activated("none")
+
+
+def test_every_policy_sees_the_same_logical_routing():
+    traces = {}
+    for balance in ("none", "eplb-1.0", "eplb-1.5"):
+        args = make_args(balance=balance)
+        physical_to_logical, owner = benchmark.make_placement(args, SHAPE, 2, 1.0)
+        steps = benchmark.make_steps(args, SHAPE, physical_to_logical, owner, 2, 0, 1.0, 16, "cpu")
+        traces[balance] = [step[0] for step in steps]
+        for assignments, physical, _ in steps:
+            assert physical_to_logical[physical].tolist() == assignments.tolist()
+    for balance in ("eplb-1.0", "eplb-1.5"):
+        assert all(torch.equal(a, b) for a, b in zip(traces["none"], traces[balance]))
+
+
+@pytest.mark.parametrize("balance, world_size, expected", [
+    ("eplb-1.0", 2, 60), ("eplb-1.5", 2, 90), ("eplb-1.0", 4, 60), ("eplb-1.5", 4, 92),
+])
+def test_physical_expert_count_divides_across_gpus(balance, world_size, expected):
+    physical_to_logical, owner = benchmark.make_placement(make_args(balance=balance), ExpertShape(), world_size, 1.5)
+    assert owner.numel() == physical_to_logical.numel() == expected
+    assert torch.bincount(owner).tolist() == [expected // world_size] * world_size
+
+
+def test_baseline_placement_is_contiguous_with_no_replicas():
+    physical_to_logical, owner = benchmark.make_placement(make_args(), SHAPE, 2, 1.5)
+    assert physical_to_logical.tolist() == list(range(8))
+    assert owner.tolist() == contiguous_placement(8, 2).tolist()
 
 
 def test_only_measured_steps_are_recorded(cpu_run):

@@ -70,7 +70,8 @@ def phase_stats(phase_start, phase_end, kernels):
 
 def summarise(path, last=20):
     """Return the median stats per process over its last compute phases, the timed steps."""
-    with sqlite3.connect(path) as connection:
+    # Read-only, because otherwise SQLite creates an empty database for a missing file.
+    with sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True) as connection:
         phases = connection.execute(COMPUTE_PHASES).fetchall()
         kernels = connection.execute(KERNELS).fetchall()
     summaries = {}

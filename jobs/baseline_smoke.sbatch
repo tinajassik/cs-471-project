@@ -6,10 +6,11 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-node=2
-#SBATCH --time=00:15:00
+#SBATCH --time=00:30:00
 #SBATCH --output=%x_%j.out
 
-# Quick correctness check: compares outputs against a single-GPU reference.
+# Quick correctness check of every balancing policy: compares outputs against a
+# single-GPU reference, which doesn't depend on placement or replicas.
 # Don't use these timings: --verify adds work and only a few steps run.
 # Submit from the repo root: sbatch jobs/baseline_smoke.sbatch
 
@@ -17,6 +18,8 @@ source jobs/env.sh
 
 nvidia-smi topo -m
 
-torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark \
-    --alphas 0,1.5 --batch-sizes 1,2,64,1024 --warmup 1 --steps 3 --verify \
-    --output "results/smoke_${SLURM_JOB_ID}.csv"
+for BALANCE in none eplb-1.0 eplb-1.5; do
+    torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark \
+        --balance "$BALANCE" --alphas 0,1.5 --batch-sizes 1,2,64,1024 --warmup 1 --steps 3 --verify \
+        --output "results/smoke_${BALANCE}_${SLURM_JOB_ID}.csv"
+done

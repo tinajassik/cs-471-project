@@ -50,7 +50,7 @@ class StepPlan:
     send_counts: list
     recv_counts: list
     local_token_idx: torch.Tensor  # home tokens whose expert is on this rank
-    expert_groups: list  # (expert ID, positions in the inbox)
+    expert_groups: list  # (physical expert ID, positions in the inbox)
     any_remote: bool  # whether any rank sends anything this step
 
     def to(self, device):
@@ -71,7 +71,8 @@ def build_plan(assignments, owner, world_size, rank):
     Only remote assignments enter the collective, as in the proposal: bytes
     moved depend on routing and placement. A token selecting two experts on one
     GPU is sent twice. Every rank walks the assignments in the same order, so
-    each receiver knows which expert each incoming token is for.
+    each receiver knows which expert each incoming token is for. assignments and
+    owner use physical expert IDs, so a replica is treated like any other expert.
     """
     batch_size, top_k = assignments.shape
     homes = token_homes(batch_size, world_size)
@@ -125,13 +126,15 @@ class Phases:
 
 
 class MoELayer(nn.Module):
-    """The experts this rank owns, with a static placement and no replicas."""
+    """The physical experts this rank owns. Each copy has its own weights in memory."""
 
-    def __init__(self, shape, owner, rank, layer_index, seed):
+    def __init__(self, shape, owner, rank, layer_index, seed, physical_to_logical=None):
         super().__init__()
         self.top_k = shape.top_k
+        if physical_to_logical is None:
+            physical_to_logical = torch.arange(owner.numel())
         self.experts = nn.ModuleDict({
-            str(e): Expert(shape, expert_seed(seed, layer_index, e))
+            str(e): Expert(shape, expert_seed(seed, layer_index, int(physical_to_logical[e])))
             for e in (owner == rank).nonzero().flatten().tolist()
         })
 

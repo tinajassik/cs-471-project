@@ -89,6 +89,13 @@ def test_summary_ignores_other_phases_and_earlier_steps(tmp_path):
     assert summary["busy_us"] == pytest.approx(0.1)
 
 
+def test_missing_file_fails_without_creating_an_empty_database(tmp_path):
+    path = tmp_path / "timeline_*_1.sqlite"
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        summarise(path)
+    assert not path.exists()
+
+
 def test_summary_reads_a_phase_name_stored_as_a_string_id(tmp_path):
     path = tmp_path / "trace.sqlite"
     make_database(path, [], [(PROCESS_A, 1, 10, 20, 120)])

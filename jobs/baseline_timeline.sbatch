@@ -33,7 +33,7 @@ for CONFIG in "64 1408" "64 22" "4096 1408" "65536 1408"; do
         torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark \
         --alphas 0 --batch-sizes "$BATCH" --expert-size "$EXPERT_SIZE" --warmup 5 --steps 20 \
         --output "$NAME.csv"
-    "$NSYS" export --type=sqlite "$NAME.nsys-rep"
+    "$NSYS" export --type=sqlite --output="$NAME.sqlite" "$NAME.nsys-rep"
 done
 
 python analysis/analyse_timeline.py results/timeline_*_"${SLURM_JOB_ID}".sqlite

@@ -34,6 +34,67 @@ def contiguous_placement(num_experts, world_size):
     return torch.arange(num_experts) * world_size // num_experts
 
 
+def measured_load(probabilities, top_k, seed, samples=100_000):
+    """Count the assignments each expert receives, as EPLB's load statistics would.
+
+    This differs from probabilities because a token picks an expert at most once,
+    which caps the hottest experts. At alpha=1.5 the hottest has p=0.43 but receives
+    23% of assignments, and balancing on p leaves GPU imbalance near 1.3.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    assignments = sample_assignments(probabilities, samples, top_k, generator)
+    return torch.bincount(assignments.flatten(), minlength=probabilities.numel()).double()
+
+
+def eplb_placement(load, num_physical, world_size):
+    """Return (physical_to_logical, owner) from DeepSeek EPLB's policy on one node.
+
+    Follows replicate_experts and balanced_packing in github.com/deepseek-ai/EPLB
+    (MIT licence). Each extra copy goes to the expert with the highest load per copy,
+    then copies are packed onto GPUs, heaviest first, into the lightest GPU with room.
+    Copies of one expert can share a GPU, and each is then a separate activation.
+    """
+    if num_physical % world_size != 0:
+        raise ValueError(f"{num_physical} physical experts don't divide across {world_size} GPUs")
+    load = load.float()
+    counts = torch.ones_like(load, dtype=torch.int64)
+    copy_of = list(range(load.numel()))
+    for _ in range(num_physical - load.numel()):
+        hottest = (load / counts).max(dim=-1).indices
+        copy_of.append(int(hottest))
+        counts[hottest] += 1
+    copy_of = torch.tensor(copy_of)
+    load_per_copy = (load / counts)[copy_of]
+
+    per_gpu = num_physical // world_size
+    gpu_load = [0.0] * world_size
+    gpu_items = [0] * world_size
+    physical_to_logical = torch.empty(num_physical, dtype=torch.int64)
+    for copy in load_per_copy.sort(descending=True).indices.tolist():
+        gpu = min((g for g in range(world_size) if gpu_items[g] < per_gpu), key=gpu_load.__getitem__)
+        physical_to_logical[gpu * per_gpu + gpu_items[gpu]] = copy_of[copy]
+        gpu_load[gpu] += load_per_copy[copy].item()
+        gpu_items[gpu] += 1
+    return physical_to_logical, contiguous_placement(num_physical, world_size)
+
+
+def route_to_replicas(assignments, physical_to_logical, generator):
+    """Turn logical expert IDs into physical ones, splitting each expert's tokens evenly.
+
+    Each expert's assignments go round-robin across its copies. The first copy is
+    random, because a fixed one would send small batches to the same GPU every step.
+    Every rank passes the same generator state, so they all get the same split.
+    """
+    flat = assignments.flatten()
+    physical = torch.empty_like(flat)
+    for expert in flat.unique():
+        mask = flat == expert
+        copies = (physical_to_logical == expert).nonzero().flatten()
+        first = torch.randint(copies.numel(), (1,), generator=generator)
+        physical[mask] = copies[(first + torch.arange(int(mask.sum()))) % copies.numel()]
+    return physical.view(assignments.shape)
+
+
 @dataclass
 class LoadMetrics:
     expert_imbalance: float
@@ -44,11 +105,19 @@ class LoadMetrics:
     activated_per_gpu: list
 
 
-def load_metrics(assignments, owner, world_size):
-    """Compute the imbalance metrics defined in the proposal for one batch."""
-    expert_load = torch.bincount(assignments.flatten(), minlength=owner.numel())
-    gpu_load = torch.bincount(owner[assignments.flatten()], minlength=world_size)
-    activated = torch.bincount(owner[expert_load > 0], minlength=world_size)
+def load_metrics(assignments, owner, world_size, physical_to_logical=None):
+    """Compute the imbalance metrics defined in the proposal for one batch.
+
+    assignments holds physical expert IDs, so activated counts copies. Expert
+    imbalance is over logical experts, because replicating doesn't change demand.
+    """
+    if physical_to_logical is None:
+        physical_to_logical = torch.arange(owner.numel())
+    flat = assignments.flatten()
+    expert_load = torch.bincount(physical_to_logical[flat], minlength=int(physical_to_logical.max()) + 1)
+    copy_load = torch.bincount(flat, minlength=owner.numel())
+    gpu_load = torch.bincount(owner[flat], minlength=world_size)
+    activated = torch.bincount(owner[copy_load > 0], minlength=world_size)
     return LoadMetrics(
         expert_imbalance=(expert_load.max() / expert_load.float().mean()).item(),
         gpu_imbalance=(gpu_load.max() / gpu_load.float().mean()).item(),

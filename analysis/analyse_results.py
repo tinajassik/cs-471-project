@@ -19,7 +19,7 @@ def load(path):
     with open(path, newline="") as file:
         rows = list(csv.DictReader(file))
     data = {c: np.array([float(r[c]) for r in rows]) for c in FLOAT_COLUMNS if c in rows[0]}
-    data["info"] = {c: rows[0].get(c, "?") for c in ("seed", "expert_size", "layers", "warm_passes")}
+    data["info"] = {c: rows[0].get(c, "?") for c in ("seed", "expert_size", "layers", "warm_passes", "balance")}
     return data
 
 
@@ -38,33 +38,39 @@ def correlation(x, y):
 
 def per_step(data, mask):
     """Return (slowest GPU's total, slowest GPU's compute, routing columns) for each step."""
-    gpu0 = mask & (data["rank"] == 0)
-    columns = [data[c][mask & (data["rank"] == r)] for c in ("total_ms", "compute_ms") for r in (0, 1)]
+    ranks = np.unique(data["rank"][mask])
+    gpu0 = mask & (data["rank"] == ranks[0])
+
+    def slowest(column):
+        return np.max([data[column][mask & (data["rank"] == r)] for r in ranks], axis=0)
+
     return (
-        np.maximum(columns[0], columns[1]),
-        np.maximum(columns[2], columns[3]),
+        slowest("total_ms"),
+        slowest("compute_ms"),
         data["max_tokens_per_gpu"][gpu0],
         data["max_activated_per_gpu"][gpu0],
     )
 
 
 def print_phases(data):
-    print(f"{'alpha':>5} {'batch':>6} | {'latency':>8} {'p90':>8} {'tokens/s':>12} | "
-          f"{'g0 disp':>7} {'g0 comp':>8} {'g0 comb':>8} | {'g1 disp':>7} {'g1 comp':>8} {'g1 comb':>8}")
+    ranks = np.unique(data["rank"]).astype(int)
+    gpu_headers = " | ".join(f"{f'g{r} disp':>7} {f'g{r} comp':>8} {f'g{r} comb':>8}" for r in ranks)
+    print(f"{'alpha':>5} {'batch':>6} | {'latency':>8} {'p90':>8} {'tokens/s':>12} | {gpu_headers}")
     for alpha in np.unique(data["alpha"]):
         for batch in np.unique(data["batch_size"]):
             mask = (data["alpha"] == alpha) & (data["batch_size"] == batch)
             if not mask.any():
                 continue
             latency = per_step(data, mask)[0]
-            medians = [
-                np.median(data[f"{phase}_ms"][mask & (data["rank"] == rank)])
-                for rank in (0, 1) for phase in ("dispatch", "compute", "combine")
-            ]
+            gpu_medians = " | ".join(
+                " ".join(
+                    f"{np.median(data[f'{phase}_ms'][mask & (data['rank'] == rank)]):{width}.3f}"
+                    for phase, width in (("dispatch", 7), ("compute", 8), ("combine", 8))
+                )
+                for rank in ranks
+            )
             print(f"{alpha:5.1f} {int(batch):6d} | {np.median(latency):8.3f} {np.percentile(latency, 90):8.3f} "
-                  f"{batch / np.median(latency) * 1000:12,.0f} | "
-                  f"{medians[0]:7.3f} {medians[1]:8.3f} {medians[2]:8.3f} | "
-                  f"{medians[3]:7.3f} {medians[4]:8.3f} {medians[5]:8.3f}")
+                  f"{batch / np.median(latency) * 1000:12,.0f} | {gpu_medians}")
 
 
 def print_q3(data):
@@ -111,7 +117,7 @@ def print_new_sizes(data):
 
 
 def print_across_files(named):
-    print(f"{'file':>42} {'seed':>5} {'size':>5} {'layers':>6} {'warm':>4} | "
+    print(f"{'file':>42} {'seed':>5} {'size':>5} {'layers':>6} {'warm':>4} {'balance':>8} | "
           f"{'per expert us':>13} {'constant us':>11} {'R^2':>6} {'new/step':>8} | {'per token us (batch >= 1024)':>28}")
     for name, data in named:
         info = data["info"]
@@ -120,7 +126,8 @@ def print_across_files(named):
         c, per_expert, _, r2 = cost_fit(data, small) if small.sum() >= 3 else (*[float("nan")] * 3, float("nan"))
         per_token = cost_fit(data, large)[2] if large.sum() >= 3 else float("nan")
         new = data["new_sizes"].mean() if "new_sizes" in data else float("nan")
-        print(f"{name:>42} {info['seed']:>5} {info['expert_size']:>5} {info['layers']:>6} {info['warm_passes']:>4} | "
+        print(f"{name:>42} {info['seed']:>5} {info['expert_size']:>5} {info['layers']:>6} {info['warm_passes']:>4} "
+              f"{info['balance']:>8} | "
               f"{per_expert:13.2f} {c:11.1f} {r2:6.3f} {new:8.3f} | {per_token:28.4f}")
 
 

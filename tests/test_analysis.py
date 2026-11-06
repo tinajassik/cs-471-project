@@ -3,7 +3,7 @@ import csv
 import numpy as np
 import pytest
 
-from analysis.analyse_results import cost_fit, load, per_step
+from analysis.analyse_results import cost_fit, load, per_step, print_phases, print_q3
 from moe_bench.benchmark import RAW_FIELDS
 
 
@@ -58,6 +58,34 @@ def test_cost_fit_does_not_invent_a_per_expert_cost_when_activated_is_constant(t
     assert constant == pytest.approx(1700, abs=0.01)
     assert per_token == pytest.approx(0.1, abs=0.001)
     assert r2 == pytest.approx(1.0)
+
+
+def test_any_number_of_gpus_is_summarised(tmp_path, capsys):
+    # Step latency is the slowest of 4 GPUs: GPU 2 is slowest in step 0, and GPU 0 in step 1.
+    totals = {(0, 0): 1.0, (0, 1): 2.0, (0, 2): 9.0, (0, 3): 3.0, (1, 0): 8.0, (1, 1): 2.0, (1, 2): 1.0, (1, 3): 3.0}
+    rows = []
+    for (step, rank), total in totals.items():
+        rows.append({
+            "seed": 471, "expert_size": 1408, "warm_passes": 1, "balance": "eplb-1.5", "physical_experts": 92,
+            "alpha": 1.0, "batch_size": 64, "layers": 1, "world_size": 4, "step": step, "rank": rank,
+            "dispatch_ms": 0.1, "compute_ms": total - 0.2, "combine_ms": 0.1, "total_ms": total,
+            "tokens": 10, "activated": 5, "bytes_sent": 0, "new_sizes": 0, "expert_imbalance": 1.0,
+            "gpu_imbalance": 1.0, "max_tokens_per_gpu": 10 + step, "max_activated_per_gpu": 5 + step,
+        })
+    path = tmp_path / "run.csv"
+    write_csv(path, rows)
+    data = load(path)
+
+    latency, compute, tokens, activated = per_step(data, data["batch_size"] == 64)
+    assert latency.tolist() == [9.0, 8.0]
+    assert compute == pytest.approx([8.8, 7.8])
+    assert tokens.tolist() == [10, 11]
+    assert activated.tolist() == [5, 6]
+
+    print_phases(data)
+    print_q3(data)
+    out = capsys.readouterr().out
+    assert "g3 comp" in out and "g4 comp" not in out
 
 
 def test_step_latency_is_the_slowest_gpu(tmp_path):

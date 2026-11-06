@@ -1,10 +1,11 @@
-"""Baseline MoE-layer benchmark: No Load Balance, contiguous placement, Zipf routing.
+"""MoE-layer benchmark with Zipf routing: No Load Balance, or EPLB placement with replicas.
 
 Launch one process per GPU:
     torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark --alphas 0,1 --batch-sizes 1,64,1024
 """
 import argparse
 import csv
+import math
 import os
 import statistics
 from pathlib import Path
@@ -20,12 +21,22 @@ from .moe_layer import (
     reference_output,
     token_homes,
 )
-from .routing import contiguous_placement, load_metrics, sample_assignments, zipf_probabilities
+from .routing import (
+    contiguous_placement,
+    eplb_placement,
+    load_metrics,
+    measured_load,
+    route_to_replicas,
+    sample_assignments,
+    zipf_probabilities,
+)
 
 PHASES = ("dispatch", "compute", "combine")
 NEXT_PHASE = {"start": "dispatch", "dispatch": "compute", "compute": "combine"}
+# Physical experts per logical expert under each balancing policy.
+EPLB_REPLICATION = {"eplb-1.0": 1.0, "eplb-1.5": 1.5}
 RAW_FIELDS = [
-    "seed", "expert_size", "warm_passes",
+    "seed", "expert_size", "warm_passes", "balance", "physical_experts",
     "alpha", "batch_size", "layers", "world_size", "step", "rank",
     "dispatch_ms", "compute_ms", "combine_ms", "total_ms",
     "tokens", "activated", "bytes_sent", "new_sizes",
@@ -70,6 +81,9 @@ def parse_args():
                              "new expert token counts; 0 keeps the first-time cost in the timings")
     parser.add_argument("--expert-size", type=int, default=ExpertShape.expert_size,
                         help="expert inner width; smaller means fewer weight bytes but the same operations")
+    parser.add_argument("--balance", default="none", choices=["none", *EPLB_REPLICATION],
+                        help="none is contiguous placement; eplb-1.0 only moves experts; eplb-1.5 also adds "
+                             "replicas of hot experts")
     parser.add_argument("--layers", type=int, default=1,
                         help="separate MoE layers to cycle through, so weights are not all in cache")
     parser.add_argument("--seed", type=int, default=471)
@@ -82,25 +96,43 @@ def parse_args():
     return args
 
 
-def make_steps(args, shape, owner, world_size, rank, alpha, batch_size, device):
-    """Build the same routing trace on every rank, from the shared seed."""
+def make_placement(args, shape, world_size, alpha):
+    """Return (physical_to_logical, owner). EPLB's depends on the load, so on alpha."""
+    if args.balance == "none":
+        return torch.arange(shape.num_experts), contiguous_placement(shape.num_experts, world_size)
+    probabilities = zipf_probabilities(shape.num_experts, alpha, args.seed)
+    load = measured_load(probabilities, shape.top_k, args.seed + 1000)
+    # Round up, because every GPU holds the same number: 1.5x on 4 GPUs is 92, not 90.
+    per_gpu = math.ceil(shape.num_experts * EPLB_REPLICATION[args.balance] / world_size)
+    return eplb_placement(load, per_gpu * world_size, world_size)
+
+
+def make_steps(args, shape, physical_to_logical, owner, world_size, rank, alpha, batch_size, device):
+    """Build the same routing trace on every rank, from the shared seed.
+
+    Replica choice has its own generator, so all policies see the same logical routing.
+    Returns (logical assignments, physical assignments, plan) for each step.
+    """
     probabilities = zipf_probabilities(shape.num_experts, alpha, args.seed)
     generator = torch.Generator().manual_seed(args.seed + 1)
+    replica_generator = torch.Generator().manual_seed(args.seed + 1001)
     steps = []
     for _ in range(args.warmup + args.steps):
         assignments = sample_assignments(probabilities, batch_size, shape.top_k, generator)
-        steps.append((assignments, build_plan(assignments, owner, world_size, rank).to(device)))
+        physical = route_to_replicas(assignments, physical_to_logical, replica_generator)
+        steps.append((assignments, physical, build_plan(physical, owner, world_size, rank).to(device)))
     return steps
 
 
-def run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, seen_sizes, device="cuda"):
+def run_config(args, shape, layers, physical_to_logical, owner, world_size, rank, alpha, batch_size, seen_sizes,
+               device="cuda"):
     """Run one (alpha, batch size) point and return this rank's per-step rows.
 
     seen_sizes holds the expert token counts this process has already computed.
     Each new count cost about 1 ms in the first sweep, so warm passes replay the
     measured routing first, and new_sizes records any left in a timed step.
     """
-    steps = make_steps(args, shape, owner, world_size, rank, alpha, batch_size, device)
+    steps = make_steps(args, shape, physical_to_logical, owner, world_size, rank, alpha, batch_size, device)
     warmup_steps, measured_steps = steps[:args.warmup], steps[args.warmup:]
     is_home = token_homes(batch_size, world_size) == rank
     input_generator = torch.Generator().manual_seed(args.seed + 2 + rank)
@@ -119,14 +151,14 @@ def run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, 
         torch.cuda.synchronize()
         return phases, output, new_sizes
 
-    for index, (_, plan) in enumerate(warmup_steps):
+    for index, (_, _, plan) in enumerate(warmup_steps):
         run_step(index, plan)
     for _ in range(args.warm_passes):
-        for index, (_, plan) in enumerate(measured_steps):
+        for index, (_, _, plan) in enumerate(measured_steps):
             run_step(index, plan)
 
     rows = []
-    for step, (assignments, plan) in enumerate(measured_steps):
+    for step, (assignments, physical, plan) in enumerate(measured_steps):
         phases, output, new_sizes = run_step(step, plan)
 
         if args.verify:
@@ -138,11 +170,13 @@ def run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, 
             )
 
         durations = phases.durations_ms()
-        metrics = load_metrics(assignments, owner, world_size)
+        metrics = load_metrics(physical, owner, world_size, physical_to_logical)
         rows.append({
             "seed": args.seed,
             "expert_size": shape.expert_size,
             "warm_passes": args.warm_passes,
+            "balance": args.balance,
+            "physical_experts": owner.numel(),
             "alpha": alpha,
             "batch_size": batch_size,
             "layers": len(layers),
@@ -192,35 +226,44 @@ def main():
     rank, world_size = dist.get_rank(), dist.get_world_size()
 
     shape = ExpertShape(expert_size=args.expert_size)
-    owner = contiguous_placement(shape.num_experts, world_size)
-    layers = [
-        MoELayer(shape, owner, rank, layer_index, args.seed).to("cuda")
-        for layer_index in range(args.layers)
-    ]
-
     writer = None
     if rank == 0:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         output_file = args.output.open("w", newline="")
         writer = csv.DictWriter(output_file, RAW_FIELDS)
         writer.writeheader()
-        expert_mb = sum(p.numel() * 2 for p in layers[0].experts["0"].parameters()) / 1e6
+        expert_mb = 3 * shape.hidden_size * shape.expert_size * 2 / 1e6
         print(f"{world_size} GPUs ({torch.cuda.get_device_name()}), {shape}, {expert_mb:.1f} MB per expert, "
-              f"{args.layers} layer(s), seed={args.seed}, warm_passes={args.warm_passes}, "
-              f"verify={args.verify}", flush=True)
+              f"{args.layers} layer(s), seed={args.seed}, balance={args.balance}, "
+              f"warm_passes={args.warm_passes}, verify={args.verify}", flush=True)
 
+    layers = None
     seen_sizes = set()
-    with torch.inference_mode():
-        for alpha in args.alphas:
-            for batch_size in args.batch_sizes:
-                rows = run_config(args, shape, layers, owner, world_size, rank, alpha, batch_size, seen_sizes)
-                gathered = [None] * world_size
-                dist.all_gather_object(gathered, rows)
-                if rank == 0:
-                    all_rows = [row for rank_rows in gathered for row in rank_rows]
-                    writer.writerows(all_rows)
-                    output_file.flush()
-                    print_summary(all_rows, world_size)
+    for alpha in args.alphas:
+        # The baseline's placement is the same for every alpha, so it keeps its weights.
+        if layers is None or args.balance != "none":
+            layers = None
+            torch.cuda.empty_cache()
+            physical_to_logical, owner = make_placement(args, shape, world_size, alpha)
+            layers = [
+                MoELayer(shape, owner, rank, layer_index, args.seed, physical_to_logical).to("cuda")
+                for layer_index in range(args.layers)
+            ]
+            if rank == 0 and args.balance != "none":
+                copies = torch.bincount(physical_to_logical).sort(descending=True).values[:6].tolist()
+                print(f"alpha={alpha}: {owner.numel()} physical experts, copies of the 6 most copied: {copies}",
+                      flush=True)
+        for batch_size in args.batch_sizes:
+            with torch.inference_mode():
+                rows = run_config(args, shape, layers, physical_to_logical, owner, world_size, rank, alpha,
+                                  batch_size, seen_sizes)
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, rows)
+            if rank == 0:
+                all_rows = [row for rank_rows in gathered for row in rank_rows]
+                writer.writerows(all_rows)
+                output_file.flush()
+                print_summary(all_rows, world_size)
 
     if rank == 0:
         output_file.close()
