@@ -105,3 +105,18 @@ def test_summary_reads_a_phase_name_stored_as_a_string_id(tmp_path):
     connection.commit()
     connection.close()
     assert summarise(path)[PROCESS_A]["kernels"] == 1
+
+
+def test_summary_reads_model_block_ranges_by_name(tmp_path):
+    # model_trace.py names ranges "moe 0", "moe 1", "attention 0", ...; "moefoo" must not match.
+    path = tmp_path / "trace.sqlite"
+    make_database(
+        path,
+        [(PROCESS_A, 0, 1000, "moe 0"), (PROCESS_A, 2000, 3000, "attention 0"), (PROCESS_A, 4000, 5000, "moe 1"),
+         (PROCESS_A, 6000, 7000, "moefoo")],
+        [(PROCESS_A, 1, 10, 20, 120), (PROCESS_A, 2, 2010, 2020, 2920), (PROCESS_A, 3, 4010, 4020, 4320),
+         (PROCESS_A, 4, 6010, 6020, 6920)],
+    )
+    summary = summarise(path, last=0, range_name="moe")[PROCESS_A]
+    assert summary["phases"] == 2
+    assert summary["busy_us"] == pytest.approx(0.2)

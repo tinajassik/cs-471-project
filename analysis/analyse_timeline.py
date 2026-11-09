@@ -1,7 +1,11 @@
 """Show whether the compute phase was waiting on the CPU or on the GPU.
 
 Usage: python analysis/analyse_timeline.py results/timeline_*.sqlite
-Reads the files made by `nsys export --type=sqlite`. Needs only NumPy.
+       python analysis/analyse_timeline.py --range moe --last 0 results/model_timeline_*.sqlite
+Reads the files made by `nsys export --type=sqlite`. Needs only NumPy. --range picks the
+NVTX ranges to read: compute (the benchmark's phase, the default), or moe or attention
+(model_trace.py's blocks, named "moe 3" and so on). --last N reads each process's last
+N ranges, and 0 reads all of them.
 
 Low GPU busy, with launch gaps much longer than kernels, means the GPU sat idle
 waiting for the CPU. Busy near 100%, with the GPU finishing after the CPU, means
@@ -20,7 +24,8 @@ NVTX_PUSH_POP_RANGE = 59
 COMPUTE_PHASES = f"""
     SELECT n.globalTid, n.start, n."end"
     FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId = s.id
-    WHERE n.eventType = {NVTX_PUSH_POP_RANGE} AND n."end" IS NOT NULL AND COALESCE(n.text, s.value) = 'compute'
+    WHERE n.eventType = {NVTX_PUSH_POP_RANGE} AND n."end" IS NOT NULL
+        AND (COALESCE(n.text, s.value) = ?1 OR COALESCE(n.text, s.value) LIKE ?1 || ' %')
     ORDER BY n.start
 """
 # Correlation IDs repeat between processes, so the join has to match the process too.
@@ -68,16 +73,16 @@ def phase_stats(phase_start, phase_end, kernels):
     }
 
 
-def summarise(path, last=20):
+def summarise(path, last=20, range_name="compute"):
     """Return the median stats per process over its last compute phases, the timed steps."""
     # Read-only, because otherwise SQLite creates an empty database for a missing file.
     with sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True) as connection:
-        phases = connection.execute(COMPUTE_PHASES).fetchall()
+        phases = connection.execute(COMPUTE_PHASES, (range_name,)).fetchall()
         kernels = connection.execute(KERNELS).fetchall()
     summaries = {}
     for thread in sorted({phase[0] for phase in phases}):
         own_kernels = [k[1:] for k in kernels if k[0] == thread]
-        own_phases = [p[1:] for p in phases if p[0] == thread][-last:]
+        own_phases = [p[1:] for p in phases if p[0] == thread][-last:]  # [-0:] keeps them all
         stats = [s for s in (phase_stats(*p, own_kernels) for p in own_phases) if s]
         if stats:
             medians = {key: float(np.median([s[key] for s in stats])) for key in stats[0]}
@@ -96,10 +101,14 @@ def print_summaries(named):
 
 
 def main():
-    paths = sys.argv[1:]
-    if not paths:
-        sys.exit(__doc__)
-    print_summaries([(Path(path).name, summarise(path)) for path in paths])
+    import argparse
+
+    parser = argparse.ArgumentParser(usage=__doc__)
+    parser.add_argument("--range", default="compute")
+    parser.add_argument("--last", type=int, default=20)
+    parser.add_argument("paths", nargs="+")
+    args = parser.parse_args()
+    print_summaries([(Path(path).name, summarise(path, args.last, args.range)) for path in args.paths])
 
 
 if __name__ == "__main__":
