@@ -144,6 +144,12 @@ python analysis/analyse_results.py results/sweep_seed*.csv
 python analysis/analyse_timeline.py results/timeline_*.sqlite
 ```
 
+The status report's figures and tables, written to `figures/` (needs pandas and matplotlib):
+
+```bash
+python analysis/report_figures.py
+```
+
 ### Run the tests
 
 These need `torch`, `numpy` and `pytest`, but no GPU:
