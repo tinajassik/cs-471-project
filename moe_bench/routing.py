@@ -29,6 +29,66 @@ def sample_assignments(probabilities, batch_size, top_k, generator):
     )
 
 
+class ZipfRouting:
+    """Synthetic routing: each token picks top_k distinct experts with Zipf popularity."""
+
+    def __init__(self, num_experts, top_k, alpha, seed):
+        self.num_experts, self.top_k, self.alpha, self.seed = num_experts, top_k, alpha, seed
+        self.label = "zipf"
+        self.probabilities = zipf_probabilities(num_experts, alpha, seed)
+
+    def load(self):
+        return measured_load(self.probabilities, self.top_k, self.seed + 1000)
+
+    def batches(self, batch_size, count, seed):
+        generator = torch.Generator().manual_seed(seed)
+        return [sample_assignments(self.probabilities, batch_size, self.top_k, generator) for _ in range(count)]
+
+
+class TraceRouting:
+    """Real routing recorded from a model: replays the experts each token actually chose.
+
+    Each step takes batch_size consecutive recorded tokens from a random start, wrapping
+    around at the end. Prefill tokens are in prompt order, so a step holds whole stretches
+    of a few prompts. Decode tokens are reordered by decode step, then by prompt, so a step
+    holds the next token of many prompts at once, as concurrent requests would.
+    """
+
+    def __init__(self, assignments, num_experts, layer, phase):
+        self.assignments = assignments.long()
+        self.num_experts, self.top_k = num_experts, assignments.shape[1]
+        self.layer, self.phase = layer, phase
+        self.alpha = float("nan")
+        self.label = f"trace-{phase}-L{layer}"
+
+    def load(self):
+        """EPLB balances on the recorded load of the whole trace, as it would on past traffic."""
+        return torch.bincount(self.assignments.flatten(), minlength=self.num_experts).double()
+
+    def batches(self, batch_size, count, seed):
+        generator = torch.Generator().manual_seed(seed)
+        total = self.assignments.shape[0]
+        starts = torch.randint(total, (count,), generator=generator)
+        return [self.assignments[(start + torch.arange(batch_size)) % total] for start in starts.tolist()]
+
+
+def load_trace(path, layer, phase):
+    """Read one layer and phase of a trace written by model_trace.py, as a TraceRouting."""
+    import json
+
+    import numpy as np
+
+    with np.load(path) as trace:
+        meta = json.loads(str(trace["meta"]))
+        if layer not in trace["layers"].tolist():
+            raise ValueError(f"{path} has no MoE layer {layer}; it has {trace['layers'].tolist()}")
+        assignments = trace[f"{phase}_{layer}"]
+        if phase == "decode":
+            order = np.lexsort((trace["decode_prompt"], trace["decode_step"]))
+            assignments = assignments[order]
+    return TraceRouting(torch.from_numpy(assignments.astype(np.int64)), meta["num_experts"], layer, phase), meta
+
+
 def contiguous_placement(num_experts, world_size):
     """Return owner[expert]: the first experts on GPU 0, the next on GPU 1, and so on."""
     return torch.arange(num_experts) * world_size // num_experts

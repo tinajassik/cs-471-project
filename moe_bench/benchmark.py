@@ -1,10 +1,14 @@
-"""MoE-layer benchmark with Zipf routing: No Load Balance, or EPLB placement with replicas.
+"""MoE-layer benchmark with Zipf or recorded routing: No Load Balance, or EPLB placement with replicas.
 
 Launch one process per GPU:
     torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark --alphas 0,1 --batch-sizes 1,64,1024
+Replay a real model's routing, recorded by model_trace.py, at that model's expert shape:
+    torchrun --standalone --nproc_per_node=2 -m moe_bench.benchmark --trace results/trace_qwen3.npz \
+        --trace-layers 0,23 --trace-phase prefill --batch-sizes 1024,65536
 """
 import argparse
 import csv
+import dataclasses
 import math
 import os
 import statistics
@@ -22,22 +26,26 @@ from .moe_layer import (
     token_homes,
 )
 from .routing import (
+    ZipfRouting,
     contiguous_placement,
     eplb_placement,
     load_metrics,
-    measured_load,
+    load_trace,
     route_to_replicas,
-    sample_assignments,
-    zipf_probabilities,
 )
 
 PHASES = ("dispatch", "compute", "combine")
 NEXT_PHASE = {"start": "dispatch", "dispatch": "compute", "compute": "combine"}
 # Physical experts per logical expert under each balancing policy.
 EPLB_REPLICATION = {"eplb-1.0": 1.0, "eplb-1.5": 1.5}
+# Expert shapes of the models we trace. A trace carries its own shape, so --trace ignores these.
+SHAPES = {
+    "qwen1.5-moe": ExpertShape(),
+    "qwen3-30b-a3b": ExpertShape(num_experts=128, top_k=8, hidden_size=2048, expert_size=768),
+}
 RAW_FIELDS = [
-    "seed", "expert_size", "warm_passes", "balance", "physical_experts",
-    "alpha", "batch_size", "layers", "world_size", "step", "rank",
+    "seed", "expert_size", "num_experts", "top_k", "warm_passes", "balance", "physical_experts",
+    "routing", "alpha", "batch_size", "layers", "world_size", "step", "rank",
     "dispatch_ms", "compute_ms", "combine_ms", "total_ms",
     "tokens", "activated", "bytes_sent", "new_sizes",
     "expert_imbalance", "gpu_imbalance", "max_tokens_per_gpu", "max_activated_per_gpu",
@@ -79,8 +87,16 @@ def parse_args():
     parser.add_argument("--warm-passes", type=int, default=1,
                         help="unmeasured replays of the measured routing, so timed steps meet no "
                              "new expert token counts; 0 keeps the first-time cost in the timings")
-    parser.add_argument("--expert-size", type=int, default=ExpertShape.expert_size,
+    parser.add_argument("--shape", default="qwen1.5-moe",
+                        help=f"expert count, top-k and expert sizes for Zipf routing: {', '.join(SHAPES)}, or a "
+                             "trace .npz to use its model's shape (for a uniform control next to a replay)")
+    parser.add_argument("--top-k", type=int, default=None, help="override the shape's top-k (Zipf routing only)")
+    parser.add_argument("--expert-size", type=int, default=None,
                         help="expert inner width; smaller means fewer weight bytes but the same operations")
+    parser.add_argument("--trace", type=Path, default=None,
+                        help="replay routing recorded by model_trace.py instead of Zipf; --alphas is then unused")
+    parser.add_argument("--trace-layers", default="0", help="MoE layers of the trace to replay, comma-separated")
+    parser.add_argument("--trace-phase", default="prefill", choices=["prefill", "decode"])
     parser.add_argument("--balance", default="none", choices=["none", *EPLB_REPLICATION],
                         help="none is contiguous placement; eplb-1.0 only moves experts; eplb-1.5 also adds "
                              "replicas of hot experts")
@@ -93,46 +109,79 @@ def parse_args():
     args = parser.parse_args()
     args.alphas = [float(a) for a in args.alphas.split(",")]
     args.batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
+    args.trace_layers = [int(layer) for layer in args.trace_layers.split(",")]
+    if args.trace and args.top_k:
+        parser.error("--top-k can't change a trace: its tokens chose a fixed number of experts")
+    if args.shape not in SHAPES and not args.shape.endswith(".npz"):
+        parser.error(f"--shape must be one of {', '.join(SHAPES)} or a trace .npz")
     return args
 
 
-def make_placement(args, shape, world_size, alpha):
-    """Return (physical_to_logical, owner). EPLB's depends on the load, so on alpha."""
+def make_shape(args, trace_meta=None):
+    """The model's expert shape: from the trace if there is one, else from --shape and overrides."""
+    if trace_meta is None and args.shape.endswith(".npz"):
+        trace_meta = trace_shape_meta(args.shape)
+    if trace_meta:
+        shape = ExpertShape(num_experts=trace_meta["num_experts"], top_k=trace_meta["top_k"],
+                            hidden_size=trace_meta["hidden_size"], expert_size=trace_meta["moe_intermediate_size"])
+    else:
+        shape = SHAPES[args.shape]
+    if args.top_k:
+        shape = dataclasses.replace(shape, top_k=args.top_k)
+    if args.expert_size:
+        shape = dataclasses.replace(shape, expert_size=args.expert_size)
+    return shape
+
+
+def trace_shape_meta(path):
+    import json
+
+    import numpy as np
+
+    with np.load(path) as trace:
+        return json.loads(str(trace["meta"]))
+
+
+def make_routings(args, shape):
+    """One routing per configuration: a Zipf skew per alpha, or a trace layer per layer."""
+    if args.trace:
+        return [load_trace(args.trace, layer, args.trace_phase)[0] for layer in args.trace_layers]
+    return [ZipfRouting(shape.num_experts, shape.top_k, alpha, args.seed) for alpha in args.alphas]
+
+
+def make_placement(args, shape, world_size, routing):
+    """Return (physical_to_logical, owner). EPLB's depends on the load, so on the routing."""
     if args.balance == "none":
         return torch.arange(shape.num_experts), contiguous_placement(shape.num_experts, world_size)
-    probabilities = zipf_probabilities(shape.num_experts, alpha, args.seed)
-    load = measured_load(probabilities, shape.top_k, args.seed + 1000)
+    load = routing.load()
     # Round up, because every GPU holds the same number: 1.5x on 4 GPUs is 92, not 90.
     per_gpu = math.ceil(shape.num_experts * EPLB_REPLICATION[args.balance] / world_size)
     return eplb_placement(load, per_gpu * world_size, world_size)
 
 
-def make_steps(args, shape, physical_to_logical, owner, world_size, rank, alpha, batch_size, device):
+def make_steps(args, shape, physical_to_logical, owner, world_size, rank, routing, batch_size, device):
     """Build the same routing trace on every rank, from the shared seed.
 
     Replica choice has its own generator, so all policies see the same logical routing.
     Returns (logical assignments, physical assignments, plan) for each step.
     """
-    probabilities = zipf_probabilities(shape.num_experts, alpha, args.seed)
-    generator = torch.Generator().manual_seed(args.seed + 1)
     replica_generator = torch.Generator().manual_seed(args.seed + 1001)
     steps = []
-    for _ in range(args.warmup + args.steps):
-        assignments = sample_assignments(probabilities, batch_size, shape.top_k, generator)
+    for assignments in routing.batches(batch_size, args.warmup + args.steps, args.seed + 1):
         physical = route_to_replicas(assignments, physical_to_logical, replica_generator)
         steps.append((assignments, physical, build_plan(physical, owner, world_size, rank).to(device)))
     return steps
 
 
-def run_config(args, shape, layers, physical_to_logical, owner, world_size, rank, alpha, batch_size, seen_sizes,
+def run_config(args, shape, layers, physical_to_logical, owner, world_size, rank, routing, batch_size, seen_sizes,
                device="cuda"):
-    """Run one (alpha, batch size) point and return this rank's per-step rows.
+    """Run one (routing, batch size) point and return this rank's per-step rows.
 
     seen_sizes holds the expert token counts this process has already computed.
     Each new count cost about 1 ms in the first sweep, so warm passes replay the
     measured routing first, and new_sizes records any left in a timed step.
     """
-    steps = make_steps(args, shape, physical_to_logical, owner, world_size, rank, alpha, batch_size, device)
+    steps = make_steps(args, shape, physical_to_logical, owner, world_size, rank, routing, batch_size, device)
     warmup_steps, measured_steps = steps[:args.warmup], steps[args.warmup:]
     is_home = token_homes(batch_size, world_size) == rank
     input_generator = torch.Generator().manual_seed(args.seed + 2 + rank)
@@ -166,7 +215,7 @@ def run_config(args, shape, layers, physical_to_logical, owner, world_size, rank
             layer = step % len(layers)
             expected = reference_output(x, home_assignments, shape, layer, args.seed)
             assert outputs_match(output, expected), (
-                f"rank {rank}: wrong output at alpha={alpha} batch={batch_size} step={step}"
+                f"rank {rank}: wrong output at {routing.label} alpha={routing.alpha} batch={batch_size} step={step}"
             )
 
         durations = phases.durations_ms()
@@ -174,10 +223,13 @@ def run_config(args, shape, layers, physical_to_logical, owner, world_size, rank
         rows.append({
             "seed": args.seed,
             "expert_size": shape.expert_size,
+            "num_experts": shape.num_experts,
+            "top_k": shape.top_k,
             "warm_passes": args.warm_passes,
             "balance": args.balance,
             "physical_experts": owner.numel(),
-            "alpha": alpha,
+            "routing": routing.label,
+            "alpha": routing.alpha,
             "batch_size": batch_size,
             "layers": len(layers),
             "world_size": world_size,
@@ -210,7 +262,7 @@ def print_summary(rows, world_size):
     first = rows[0]
     throughput = first["batch_size"] / (latency / 1000)
     print(
-        f"alpha={first['alpha']:<4} batch={first['batch_size']:<5} "
+        f"{first.get('routing', 'zipf')} alpha={first['alpha']:<4} batch={first['batch_size']:<5} "
         f"latency={latency:.3f} ms  throughput={throughput:,.0f} tokens/s  "
         f"gpu_imbalance={statistics.median(r['gpu_imbalance'] for r in rows):.2f}  "
         f"new_sizes={sum(r['new_sizes'] for r in rows)}  {per_rank}",
@@ -225,7 +277,9 @@ def main():
     dist.init_process_group("nccl", device_id=device)
     rank, world_size = dist.get_rank(), dist.get_world_size()
 
-    shape = ExpertShape(expert_size=args.expert_size)
+    trace_meta = load_trace(args.trace, args.trace_layers[0], args.trace_phase)[1] if args.trace else None
+    shape = make_shape(args, trace_meta)
+    routings = make_routings(args, shape)
     writer = None
     if rank == 0:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -236,26 +290,29 @@ def main():
         print(f"{world_size} GPUs ({torch.cuda.get_device_name()}), {shape}, {expert_mb:.1f} MB per expert, "
               f"{args.layers} layer(s), seed={args.seed}, balance={args.balance}, "
               f"warm_passes={args.warm_passes}, verify={args.verify}", flush=True)
+        if args.trace:
+            print(f"replaying {args.trace_phase} routing of {trace_meta['model']} from {args.trace}: "
+                  + ", ".join(f"layer {r.layer} ({r.assignments.shape[0]} tokens)" for r in routings), flush=True)
 
     layers = None
     seen_sizes = set()
-    for alpha in args.alphas:
-        # The baseline's placement is the same for every alpha, so it keeps its weights.
+    for routing in routings:
+        # The baseline's placement is the same for every routing, so it keeps its weights.
         if layers is None or args.balance != "none":
             layers = None
             torch.cuda.empty_cache()
-            physical_to_logical, owner = make_placement(args, shape, world_size, alpha)
+            physical_to_logical, owner = make_placement(args, shape, world_size, routing)
             layers = [
                 MoELayer(shape, owner, rank, layer_index, args.seed, physical_to_logical).to("cuda")
                 for layer_index in range(args.layers)
             ]
             if rank == 0 and args.balance != "none":
                 copies = torch.bincount(physical_to_logical).sort(descending=True).values[:6].tolist()
-                print(f"alpha={alpha}: {owner.numel()} physical experts, copies of the 6 most copied: {copies}",
+                print(f"{routing.label} alpha={routing.alpha}: {owner.numel()} physical experts, copies of the 6 most copied: {copies}",
                       flush=True)
         for batch_size in args.batch_sizes:
             with torch.inference_mode():
-                rows = run_config(args, shape, layers, physical_to_logical, owner, world_size, rank, alpha,
+                rows = run_config(args, shape, layers, physical_to_logical, owner, world_size, rank, routing,
                                   batch_size, seen_sizes)
             gathered = [None] * world_size
             dist.all_gather_object(gathered, rows)

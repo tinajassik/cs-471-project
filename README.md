@@ -144,15 +144,99 @@ python analysis/analyse_results.py results/sweep_seed*.csv
 python analysis/analyse_timeline.py results/timeline_*.sqlite
 ```
 
-The status report's figures and tables, written to `figures/` (needs pandas and matplotlib):
+## Real models (Q5)
+
+These jobs run the unmodified models from Hugging Face: Qwen1.5-MoE-A2.7B, and the
+larger Qwen3-30B-A3B (128 experts, top-8, 48 MoE layers).
+
+| File | Contents |
+|---|---|
+| `moe_bench/model_trace.py` | Runs a model on prompts; router hooks record each token's experts, block hooks time attention and MoE |
+| `moe_bench/prompts.py` | GSM8K and HumanEval prompts, so routing can be compared across maths and code |
+| `analysis/analyse_trace.py` | Skew per layer and phase, fitted alpha, stability of hot experts, MoE share of each forward pass |
+| `analysis/analyse_replay.py` | Replayed real routing against uniform routing and across policies |
+
+**Tracing.** The model runs on one GPU, one prompt at a time: a prefill of the whole
+prompt, then greedy decoding of up to 128 tokens. A forward hook on each router records
+the experts every token chose. Hooks only observe, so the output is unchanged (the tests
+check this, and that the choices match the model's own router). Each layer's attention and
+MoE block are timed with CUDA events and labelled with NVTX. The trace is not
+expert-parallel: Hugging Face runs every expert on the one GPU. Expert parallelism comes
+from replaying the trace in the benchmark.
+
+**Expert implementations.** transformers 5.x runs all of a layer's experts as one grouped
+GEMM by default (`grouped_mm`), and can still use its loop over experts (`eager`), which
+launches kernels for each expert like our benchmark does. `model_trace.sbatch` times both,
+which tests on the real model whether decode is launch-bound. transformers 4.x only has
+the loop.
+
+**Fitted alpha.** For each layer, the Zipf alpha whose assignment shares, under the
+benchmark's sampling rule, are closest to the recorded ones, with their total variation
+distance. A distance above 0.05 means a Zipf curve describes that layer poorly, and the
+replay is the better test. `noise` is the alpha a uniform router would fit with as many
+tokens, from sampling noise alone.
+
+**Replay.** `benchmark.py --trace` replays a layer's recorded choices at the traced
+model's expert shape. A prefill step takes consecutive tokens, so whole stretches of a few
+prompts. A decode step takes the next token of many prompts, as concurrent requests
+would, so decode batches can't exceed the number of prompts. EPLB balances on the
+layer's recorded load. Steps larger than the trace reuse its tokens.
+
+### Run on Kuma
+
+First, once, on the login node (compute nodes have no internet). This installs
+transformers, accelerate and datasets in the venv if they are missing, and downloads
+about 90 GB of weights to `$GROUP_DIR/models`:
 
 ```bash
-python analysis/report_figures.py
+bash jobs/fetch_inputs.sh
 ```
+
+Then record both models' routing and timings (one GPU):
+
+```bash
+sbatch jobs/model_trace.sbatch
+```
+
+Nsight Systems timelines of a few prompts, to see whether the MoE blocks wait on the CPU:
+
+```bash
+sbatch jobs/model_timeline.sbatch
+```
+
+Replay a trace on 2 GPUs, then on 4, with the least, median and most skewed layers:
+
+```bash
+sbatch --export=ALL,TRACE=results/trace_qwen3-30b-a3b_<job>.npz jobs/replay_sweep.sbatch
+```
+
+```bash
+sbatch --gpus-per-node=4 --cpus-per-task=32 --export=ALL,TRACE=results/trace_qwen3-30b-a3b_<job>.npz jobs/replay_sweep.sbatch
+```
+
+And the Zipf sweep at other top-k values and at Qwen3-30B-A3B's shape:
+
+```bash
+sbatch jobs/topk_sweep.sbatch
+```
+
+### Analyse
+
+```bash
+python analysis/analyse_trace.py results/trace_qwen3-30b-a3b_<job>.npz
+```
+
+```bash
+python analysis/analyse_replay.py results/replay_*.csv
+```
+
+The benchmark also takes `--shape qwen3-30b-a3b` and `--top-k` for Zipf routing, and
+`--shape <trace>.npz` for uniform routing at a traced model's shape.
 
 ### Run the tests
 
-These need `torch`, `numpy` and `pytest`, but no GPU:
+These need `torch`, `numpy` and `pytest`, but no GPU. The tracer tests build tiny random
+Qwen MoE models and are skipped without `transformers`:
 
 ```bash
 python -m pytest tests
